@@ -21,8 +21,8 @@ import {
     ListToolsRequestSchema,
     CallToolRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
-import { Context } from "@zilliz/claude-context-core";
-import { MilvusVectorDatabase } from "@zilliz/claude-context-core";
+import { Context } from "claude-context-core";
+import { QdrantVectorDatabase } from "claude-context-core";
 
 // Import our modular components
 import { createMcpConfig, logConfigurationSummary, showHelpMessage, ContextMcpConfig } from "./config.js";
@@ -53,16 +53,15 @@ class ContextMcpServer {
         );
 
         // Initialize embedding provider
-        console.log(`[EMBEDDING] Initializing embedding provider: ${config.embeddingProvider}`);
-        console.log(`[EMBEDDING] Using model: ${config.embeddingModel}`);
+        console.log(`[EMBEDDING] Initializing Ollama embedding provider`);
+        console.log(`[EMBEDDING] Using model: ${config.ollamaModel}`);
 
         const embedding = createEmbeddingInstance(config);
         logEmbeddingProviderInfo(config, embedding);
 
         // Initialize vector database
-        const vectorDatabase = new MilvusVectorDatabase({
-            address: config.milvusAddress,
-            ...(config.milvusToken && { token: config.milvusToken })
+        const vectorDatabase = new QdrantVectorDatabase({
+            url: config.qdrantUrl,
         });
 
         // Initialize Claude Context
@@ -221,6 +220,24 @@ This tool is versatile and can be used before completing various tasks to retrie
                             required: ["path"]
                         }
                     },
+                    {
+                        name: "reindex_subpath",
+                        description: `Re-index only a specific sub-path of an already-indexed codebase. Much faster than re-indexing the entire codebase when only a subset of files have changed.\n\n⚠️ **IMPORTANT**:\n- The codebase must already be indexed.\n- The path must be an absolute path to the codebase root.\n- The subpath is relative to the codebase root (e.g., 'src/components' or 'packages/core').`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                path: {
+                                    type: "string",
+                                    description: `ABSOLUTE path to the already-indexed codebase root directory.`
+                                },
+                                subpath: {
+                                    type: "string",
+                                    description: `Relative sub-path within the codebase to re-index (e.g., 'src/components', 'packages/core').`
+                                }
+                            },
+                            required: ["path", "subpath"]
+                        }
+                    },
                 ]
             };
         });
@@ -238,6 +255,8 @@ This tool is versatile and can be used before completing various tasks to retrie
                     return await this.toolHandlers.handleClearIndex(args);
                 case "get_indexing_status":
                     return await this.toolHandlers.handleGetIndexingStatus(args);
+                case "reindex_subpath":
+                    return await this.toolHandlers.handleReindexSubpath(args);
 
                 default:
                     throw new Error(`Unknown tool: ${name}`);

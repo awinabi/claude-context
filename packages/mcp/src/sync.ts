@@ -1,5 +1,5 @@
 import * as fs from "fs";
-import { Context, FileSynchronizer } from "@zilliz/claude-context-core";
+import { Context, FileSynchronizer } from "claude-context-core";
 import { SnapshotManager } from "./snapshot.js";
 
 export class SyncManager {
@@ -42,7 +42,6 @@ export class SyncManager {
 
                 console.log(`[SYNC-DEBUG] [${i + 1}/${indexedCodebases.length}] Starting sync for codebase: '${codebasePath}'`);
 
-                // Check if codebase path still exists
                 try {
                     const pathExists = fs.existsSync(codebasePath);
                     console.log(`[SYNC-DEBUG] Codebase path exists: ${pathExists}`);
@@ -64,7 +63,6 @@ export class SyncManager {
                     console.log(`[SYNC-DEBUG] Reindex stats for '${codebasePath}':`, stats);
                     console.log(`[SYNC-DEBUG] Codebase sync completed in ${codebaseElapsed}ms`);
 
-                    // Accumulate total stats
                     totalStats.added += stats.added;
                     totalStats.removed += stats.removed;
                     totalStats.modified += stats.modified;
@@ -77,19 +75,10 @@ export class SyncManager {
                 } catch (error: any) {
                     const codebaseElapsed = Date.now() - codebaseStartTime;
                     console.error(`[SYNC-DEBUG] Error syncing codebase '${codebasePath}' after ${codebaseElapsed}ms:`, error);
-                    console.error(`[SYNC-DEBUG] Error stack:`, error.stack);
 
-                    if (error.message.includes('Failed to query Milvus')) {
+                    if (error.message?.includes('Failed to query collection') || error.message?.includes('Not found')) {
                         // Collection maybe deleted manually, delete the snapshot file
                         await FileSynchronizer.deleteSnapshot(codebasePath);
-                    }
-
-                    // Log additional error details
-                    if (error.code) {
-                        console.error(`[SYNC-DEBUG] Error code: ${error.code}`);
-                    }
-                    if (error.errno) {
-                        console.error(`[SYNC-DEBUG] Error errno: ${error.errno}`);
                     }
 
                     // Continue with next codebase even if one fails
@@ -97,13 +86,10 @@ export class SyncManager {
             }
 
             const totalElapsed = Date.now() - syncStartTime;
-            console.log(`[SYNC-DEBUG] Total sync stats across all codebases: Added: ${totalStats.added}, Removed: ${totalStats.removed}, Modified: ${totalStats.modified}`);
-            console.log(`[SYNC-DEBUG] Index sync completed for all codebases in ${totalElapsed}ms`);
             console.log(`[SYNC] Index sync completed for all codebases. Total changes - Added: ${totalStats.added}, Removed: ${totalStats.removed}, Modified: ${totalStats.modified}`);
         } catch (error: any) {
             const totalElapsed = Date.now() - syncStartTime;
             console.error(`[SYNC-DEBUG] Error during index sync after ${totalElapsed}ms:`, error);
-            console.error(`[SYNC-DEBUG] Error stack:`, error.stack);
         } finally {
             this.isSyncing = false;
             const totalElapsed = Date.now() - syncStartTime;
@@ -122,22 +108,22 @@ export class SyncManager {
                 await this.handleSyncIndex();
             } catch (error) {
                 const errorMessage = error instanceof Error ? error.message : String(error);
-                if (errorMessage.includes('Failed to query collection')) {
-                    console.log('[SYNC-DEBUG] Collection not yet established, this is expected for new cluster users. Will retry on next sync cycle.');
+                if (errorMessage.includes('Failed to query collection') || errorMessage.includes('Not found')) {
+                    console.log('[SYNC-DEBUG] Collection not yet established, this is expected for new setups. Will retry on next sync cycle.');
                 } else {
                     console.error('[SYNC-DEBUG] Initial sync failed with unexpected error:', error);
                     throw error;
                 }
             }
-        }, 5000); // Initial sync after 5 seconds
+        }, 5000);
 
         // Periodically check for file changes and update the index
         console.log('[SYNC-DEBUG] Setting up periodic sync every 5 minutes (300000ms)');
         const syncInterval = setInterval(() => {
             console.log('[SYNC-DEBUG] Executing scheduled periodic sync');
             this.handleSyncIndex();
-        }, 5 * 60 * 1000); // every 5 minutes
+        }, 5 * 60 * 1000);
 
         console.log('[SYNC-DEBUG] Background sync setup complete. Interval ID:', syncInterval);
     }
-} 
+}

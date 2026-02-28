@@ -21,10 +21,10 @@
         "incremental": true,
         "tsBuildInfoFile": ".tsbuildinfo",
         "paths": {
-            "@zilliz/claude-context-core": [
+            "claude-context-core": [
                 "./packages/core/src"
             ],
-            "@zilliz/claude-context-core/*": [
+            "claude-context-core/*": [
                 "./packages/core/src/*"
             ]
         }
@@ -32,12 +32,6 @@
     "references": [
         {
             "path": "./packages/core"
-        },
-        {
-            "path": "./packages/vscode-extension"
-        },
-        {
-            "path": "./packages/chrome-extension"
         },
         {
             "path": "./packages/mcp"

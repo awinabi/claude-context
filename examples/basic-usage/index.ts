@@ -1,5 +1,5 @@
-import { Context, MilvusVectorDatabase, MilvusRestfulVectorDatabase, AstCodeSplitter, LangChainCodeSplitter } from '@zilliz/claude-context-core';
-import { envManager } from '@zilliz/claude-context-core';
+import { Context, QdrantVectorDatabase, AstCodeSplitter, LangChainCodeSplitter } from 'claude-context-core';
+import { envManager } from 'claude-context-core';
 import * as path from 'path';
 
 // Try to load .env file
@@ -14,33 +14,16 @@ async function main() {
     console.log('===============================');
 
     try {
-        // 1. Choose Vector Database implementation
-        // Set to true to use RESTful API (for environments without gRPC support)
-        // Set to false to use gRPC (default, more efficient)
-        const useRestfulApi = false;
-        const milvusAddress = envManager.get('MILVUS_ADDRESS') || 'localhost:19530';
-        const milvusToken = envManager.get('MILVUS_TOKEN');
+        const qdrantUrl = envManager.get('QDRANT_URL') || 'http://localhost:6333';
         const splitterType = envManager.get('SPLITTER_TYPE')?.toLowerCase() || 'ast';
 
-        console.log(`🔧 Using ${useRestfulApi ? 'RESTful API' : 'gRPC'} implementation`);
-        console.log(`🔌 Connecting to Milvus at: ${milvusAddress}`);
+        console.log(`🔌 Connecting to Qdrant at: ${qdrantUrl}`);
 
-        let vectorDatabase;
-        if (useRestfulApi) {
-            // Use RESTful implementation (for environments without gRPC support)
-            vectorDatabase = new MilvusRestfulVectorDatabase({
-                address: milvusAddress,
-                ...(milvusToken && { token: milvusToken })
-            });
-        } else {
-            // Use gRPC implementation (default, more efficient)
-            vectorDatabase = new MilvusVectorDatabase({
-                address: milvusAddress,
-                ...(milvusToken && { token: milvusToken })
-            });
-        }
+        const vectorDatabase = new QdrantVectorDatabase({
+            url: qdrantUrl,
+        });
 
-        // 2. Create Context instance
+        // Create Context instance
         let codeSplitter;
         if (splitterType === 'langchain') {
             codeSplitter = new LangChainCodeSplitter(1000, 200);
@@ -53,11 +36,10 @@ async function main() {
             supportedExtensions: ['.ts', '.js', '.py', '.java', '.cpp', '.go', '.rs']
         });
 
-        // 3. Check if index already exists and clear if needed
+        // Check if index already exists and clear if needed
         console.log('\n📖 Starting to index codebase...');
         const codebasePath = path.join(__dirname, '../..'); // Index entire project
 
-        // Check if index already exists
         const hasExistingIndex = await context.hasIndex(codebasePath);
         if (hasExistingIndex) {
             console.log('🗑️  Existing index found, clearing it first...');
@@ -67,10 +49,9 @@ async function main() {
         // Index with progress tracking
         const indexStats = await context.indexCodebase(codebasePath);
 
-        // 4. Show indexing statistics
         console.log(`\n📊 Indexing stats: ${indexStats.indexedFiles} files, ${indexStats.totalChunks} code chunks`);
 
-        // 5. Perform semantic search
+        // Perform semantic search
         console.log('\n🔍 Performing semantic search...');
 
         const queries = [
@@ -102,25 +83,21 @@ async function main() {
     } catch (error) {
         console.error('❌ Error occurred:', error);
 
-        // Provide detailed error diagnostics
         if (error instanceof Error) {
-            if (error.message.includes('API key')) {
-                console.log('\n💡 Please make sure to set the correct OPENAI_API_KEY environment variable');
-                console.log('   Example: export OPENAI_API_KEY="your-actual-api-key"');
-            } else if (error.message.includes('Milvus') || error.message.includes('connect')) {
-                console.log('\n💡 Please make sure Milvus service is running');
-                console.log('   - Default address: localhost:19530');
-                console.log('   - Can be modified via MILVUS_ADDRESS environment variable');
-                console.log('   - For RESTful API: set MILVUS_USE_RESTFUL=true');
-                console.log('   - For gRPC (default): set MILVUS_USE_RESTFUL=false or leave unset');
-                console.log('   - Start Milvus: docker run -p 19530:19530 milvusdb/milvus:latest');
+            if (error.message.includes('Qdrant') || error.message.includes('connect')) {
+                console.log('\n💡 Please make sure Qdrant is running');
+                console.log('   - Default URL: http://localhost:6333');
+                console.log('   - Start Qdrant: docker run -p 6333:6333 qdrant/qdrant');
+            }
+            if (error.message.includes('Ollama') || error.message.includes('embed')) {
+                console.log('\n💡 Please make sure Ollama is running with nomic-embed-text');
+                console.log('   - Pull model: ollama pull nomic-embed-text');
             }
 
             console.log('\n💡 Environment Variables:');
-            console.log('   - OPENAI_API_KEY: Your OpenAI API key (required)');
-            console.log('   - OPENAI_BASE_URL: Custom OpenAI API endpoint (optional)');
-            console.log('   - MILVUS_ADDRESS: Milvus server address (default: localhost:19530)');
-            console.log('   - MILVUS_TOKEN: Milvus authentication token (optional)');
+            console.log('   - QDRANT_URL: Qdrant server URL (default: http://localhost:6333)');
+            console.log('   - OLLAMA_HOST: Ollama server host (default: http://127.0.0.1:11434)');
+            console.log('   - OLLAMA_MODEL: Ollama model name (default: nomic-embed-text)');
             console.log('   - SPLITTER_TYPE: Code splitter type - "ast" or "langchain" (default: ast)');
         }
 

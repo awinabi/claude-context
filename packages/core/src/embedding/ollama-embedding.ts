@@ -1,4 +1,3 @@
-import { Ollama } from 'ollama';
 import { Embedding, EmbeddingVector } from './base-embedding';
 
 export interface OllamaEmbeddingConfig {
@@ -7,121 +6,133 @@ export interface OllamaEmbeddingConfig {
     fetch?: any;
     keepAlive?: string | number;
     options?: Record<string, any>;
-    dimension?: number; // Optional dimension parameter
-    maxTokens?: number; // Optional max tokens parameter
+    dimension?: number;
+    maxTokens?: number;
 }
 
 export class OllamaEmbedding extends Embedding {
-    private client: Ollama;
+    private host: string;
     private config: OllamaEmbeddingConfig;
-    private dimension: number = 768; // Default dimension for many embedding models
-    private dimensionDetected: boolean = false; // Track if dimension has been detected
-    protected maxTokens: number = 2048; // Default context window for Ollama
+    private dimension: number = 768;
+    private dimensionDetected: boolean = false;
+    protected maxTokens: number = 2048;
 
     constructor(config: OllamaEmbeddingConfig) {
         super();
         this.config = config;
-        this.client = new Ollama({
-            host: config.host || 'http://127.0.0.1:11434',
-            fetch: config.fetch,
-        });
+        this.host = (config.host || 'http://127.0.0.1:11434').replace(/\/$/, '');
 
-        // Set dimension based on config or will be detected on first use
         if (config.dimension) {
             this.dimension = config.dimension;
             this.dimensionDetected = true;
         }
 
-        // Set max tokens based on config or use default
         if (config.maxTokens) {
             this.maxTokens = config.maxTokens;
         } else {
-            // Set default based on known models
             this.setDefaultMaxTokensForModel(config.model);
         }
-
-        // If no dimension is provided, it will be detected in the first embed call
     }
 
     private setDefaultMaxTokensForModel(model: string): void {
-        // Set different max tokens based on known models
         if (model?.includes('nomic-embed-text')) {
-            this.maxTokens = 8192; // nomic-embed-text supports 8192 tokens
+            this.maxTokens = 8192;
         } else if (model?.includes('snowflake-arctic-embed')) {
-            this.maxTokens = 8192; // snowflake-arctic-embed supports 8192 tokens
+            this.maxTokens = 8192;
         } else {
-            this.maxTokens = 2048; // Default for most Ollama models
+            this.maxTokens = 2048;
         }
     }
 
+    /**
+     * Call Ollama embed API directly via HTTP to avoid ollama npm package proxy issues.
+     */
+    private async callEmbedApi(input: string | string[]): Promise<number[][]> {
+        const body: any = {
+            model: this.config.model,
+            input,
+        };
+        if (this.config.keepAlive && this.config.keepAlive !== '') {
+            body.keep_alive = this.config.keepAlive;
+        }
+        if (this.config.options) {
+            body.options = this.config.options;
+        }
+
+        const response = await fetch(`${this.host}/api/embed`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+
+        if (!response.ok) {
+            const text = await response.text();
+            throw new Error(`Ollama API error ${response.status}: ${text}`);
+        }
+
+        const data = await response.json() as { embeddings: number[][] };
+        if (!data.embeddings || !Array.isArray(data.embeddings)) {
+            throw new Error('Ollama API returned invalid response');
+        }
+        return data.embeddings;
+    }
+
     async embed(text: string): Promise<EmbeddingVector> {
-        // Preprocess the text
         const processedText = this.preprocessText(text);
 
-        // Detect dimension on first use if not configured
         if (!this.dimensionDetected && !this.config.dimension) {
             this.dimension = await this.detectDimension();
             this.dimensionDetected = true;
-            console.log(`[OllamaEmbedding] 📏 Detected Ollama embedding dimension: ${this.dimension} for model: ${this.config.model}`);
+            console.log(`[OllamaEmbedding] 📏 Detected embedding dimension: ${this.dimension} for model: ${this.config.model}`);
         }
 
-        const embedOptions: any = {
-            model: this.config.model,
-            input: processedText,
-            options: this.config.options,
-        };
-
-        // Only include keep_alive if it has a valid value
-        if (this.config.keepAlive && this.config.keepAlive !== '') {
-            embedOptions.keep_alive = this.config.keepAlive;
-        }
-
-        const response = await this.client.embed(embedOptions);
-
-        if (!response.embeddings || !response.embeddings[0]) {
-            throw new Error('Ollama API returned invalid response');
-        }
+        const embeddings = await this.callEmbedApi(processedText);
 
         return {
-            vector: response.embeddings[0],
+            vector: embeddings[0],
             dimension: this.dimension
         };
     }
 
     async embedBatch(texts: string[]): Promise<EmbeddingVector[]> {
-        // Preprocess all texts
         const processedTexts = this.preprocessTexts(texts);
 
-        // Detect dimension on first use if not configured
         if (!this.dimensionDetected && !this.config.dimension) {
             this.dimension = await this.detectDimension();
             this.dimensionDetected = true;
-            console.log(`[OllamaEmbedding] 📏 Detected Ollama embedding dimension: ${this.dimension} for model: ${this.config.model}`);
+            console.log(`[OllamaEmbedding] 📏 Detected embedding dimension: ${this.dimension} for model: ${this.config.model}`);
         }
 
-        // Use Ollama's native batch embedding API
-        const embedOptions: any = {
-            model: this.config.model,
-            input: processedTexts, // Pass array directly to Ollama
-            options: this.config.options,
-        };
+        // Process individually with retry to handle transient Ollama errors
+        const MAX_RETRIES = 3;
+        const allEmbeddings: EmbeddingVector[] = [];
 
-        // Only include keep_alive if it has a valid value
-        if (this.config.keepAlive && this.config.keepAlive !== '') {
-            embedOptions.keep_alive = this.config.keepAlive;
+        for (const text of processedTexts) {
+            let lastError: Error | null = null;
+            for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+                try {
+                    const embeddings = await this.callEmbedApi(text);
+                    allEmbeddings.push({
+                        vector: embeddings[0],
+                        dimension: this.dimension
+                    });
+                    lastError = null;
+                    break;
+                } catch (error: any) {
+                    lastError = error;
+                    if (attempt < MAX_RETRIES - 1) {
+                        const delay = 1000 * (attempt + 1);
+                        console.warn(`[OllamaEmbedding] Embed attempt ${attempt + 1} failed, retrying in ${delay}ms...`);
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                    }
+                }
+            }
+            if (lastError) {
+                throw lastError;
+            }
         }
 
-        const response = await this.client.embed(embedOptions);
-
-        if (!response.embeddings || !Array.isArray(response.embeddings)) {
-            throw new Error('Ollama API returned invalid batch response');
-        }
-
-        // Convert to EmbeddingVector format
-        return response.embeddings.map((embedding: number[]) => ({
-            vector: embedding,
-            dimension: this.dimension
-        }));
+        return allEmbeddings;
     }
 
     getDimension(): number {
@@ -132,67 +143,33 @@ export class OllamaEmbedding extends Embedding {
         return 'Ollama';
     }
 
-    /**
-     * Set model type and detect its dimension
-     * @param model Model name
-     */
     async setModel(model: string): Promise<void> {
         this.config.model = model;
-        // Reset dimension detection when model changes
         this.dimensionDetected = false;
-        // Update max tokens for new model
         this.setDefaultMaxTokensForModel(model);
         if (!this.config.dimension) {
             this.dimension = await this.detectDimension();
             this.dimensionDetected = true;
-            console.log(`[OllamaEmbedding] 📏 Detected Ollama embedding dimension: ${this.dimension} for model: ${this.config.model}`);
-        } else {
-            console.log('[OllamaEmbedding] Dimension already detected for model ' + this.config.model);
+            console.log(`[OllamaEmbedding] 📏 Detected embedding dimension: ${this.dimension} for model: ${this.config.model}`);
         }
     }
 
-    /**
-     * Set host URL
-     * @param host Ollama host URL
-     */
     setHost(host: string): void {
         this.config.host = host;
-        this.client = new Ollama({
-            host: host,
-            fetch: this.config.fetch,
-        });
+        this.host = host.replace(/\/$/, '');
     }
 
-    /**
-     * Set keep alive duration
-     * @param keepAlive Keep alive duration
-     */
     setKeepAlive(keepAlive: string | number): void {
         this.config.keepAlive = keepAlive;
     }
 
-    /**
-     * Set additional options
-     * @param options Additional options for the model
-     */
     setOptions(options: Record<string, any>): void {
         this.config.options = options;
     }
 
-    /**
-     * Set max tokens manually
-     * @param maxTokens Maximum number of tokens
-     */
     setMaxTokens(maxTokens: number): void {
         this.config.maxTokens = maxTokens;
         this.maxTokens = maxTokens;
-    }
-
-    /**
-     * Get client instance (for advanced usage)
-     */
-    getClient(): Ollama {
-        return this.client;
     }
 
     async detectDimension(testText: string = "test"): Promise<number> {
@@ -200,23 +177,8 @@ export class OllamaEmbedding extends Embedding {
 
         try {
             const processedText = this.preprocessText(testText);
-            const embedOptions: any = {
-                model: this.config.model,
-                input: processedText,
-                options: this.config.options,
-            };
-
-            if (this.config.keepAlive && this.config.keepAlive !== '') {
-                embedOptions.keep_alive = this.config.keepAlive;
-            }
-
-            const response = await this.client.embed(embedOptions);
-
-            if (!response.embeddings || !response.embeddings[0]) {
-                throw new Error('Ollama API returned invalid response');
-            }
-
-            const dimension = response.embeddings[0].length;
+            const embeddings = await this.callEmbedApi(processedText);
+            const dimension = embeddings[0].length;
             console.log(`[OllamaEmbedding] Successfully detected embedding dimension: ${dimension}`);
             return dimension;
         } catch (error) {

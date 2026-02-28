@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
-import { Context, COLLECTION_LIMIT_MESSAGE } from "@zilliz/claude-context-core";
+import { Context } from "claude-context-core";
 import { SnapshotManager } from "./snapshot.js";
 import { ensureAbsolutePath, truncateContent, trackCodebasePath } from "./utils.js";
 
@@ -18,129 +18,6 @@ export class ToolHandlers {
         console.log(`[WORKSPACE] Current workspace: ${this.currentWorkspace}`);
     }
 
-    /**
-     * Sync indexed codebases from Zilliz Cloud collections
-     * This method fetches all collections from the vector database,
-     * gets the first document from each collection to extract codebasePath from metadata,
-     * and updates the snapshot with discovered codebases.
-     * 
-     * Logic: Compare mcp-codebase-snapshot.json with zilliz cloud collections
-     * - If local snapshot has extra directories (not in cloud), remove them
-     * - If local snapshot is missing directories (exist in cloud), ignore them
-     */
-    private async syncIndexedCodebasesFromCloud(): Promise<void> {
-        try {
-            console.log(`[SYNC-CLOUD] 🔄 Syncing indexed codebases from Zilliz Cloud...`);
-
-            // Get all collections using the interface method
-            const vectorDb = this.context.getVectorDatabase();
-
-            // Use the new listCollections method from the interface
-            const collections = await vectorDb.listCollections();
-
-            console.log(`[SYNC-CLOUD] 📋 Found ${collections.length} collections in Zilliz Cloud`);
-
-            if (collections.length === 0) {
-                console.log(`[SYNC-CLOUD] ✅ No collections found in cloud`);
-                // If no collections in cloud, remove all local codebases
-                const localCodebases = this.snapshotManager.getIndexedCodebases();
-                if (localCodebases.length > 0) {
-                    console.log(`[SYNC-CLOUD] 🧹 Removing ${localCodebases.length} local codebases as cloud has no collections`);
-                    for (const codebasePath of localCodebases) {
-                        this.snapshotManager.removeIndexedCodebase(codebasePath);
-                        console.log(`[SYNC-CLOUD] ➖ Removed local codebase: ${codebasePath}`);
-                    }
-                    this.snapshotManager.saveCodebaseSnapshot();
-                    console.log(`[SYNC-CLOUD] 💾 Updated snapshot to match empty cloud state`);
-                }
-                return;
-            }
-
-            const cloudCodebases = new Set<string>();
-
-            // Check each collection for codebase path
-            for (const collectionName of collections) {
-                try {
-                    // Skip collections that don't match the code_chunks pattern (support both legacy and new collections)
-                    if (!collectionName.startsWith('code_chunks_') && !collectionName.startsWith('hybrid_code_chunks_')) {
-                        console.log(`[SYNC-CLOUD] ⏭️  Skipping non-code collection: ${collectionName}`);
-                        continue;
-                    }
-
-                    console.log(`[SYNC-CLOUD] 🔍 Checking collection: ${collectionName}`);
-
-                    // Query the first document to get metadata
-                    const results = await vectorDb.query(
-                        collectionName,
-                        '', // Empty filter to get all results
-                        ['metadata'], // Only fetch metadata field
-                        1 // Only need one result to extract codebasePath
-                    );
-
-                    if (results && results.length > 0) {
-                        const firstResult = results[0];
-                        const metadataStr = firstResult.metadata;
-
-                        if (metadataStr) {
-                            try {
-                                const metadata = JSON.parse(metadataStr);
-                                const codebasePath = metadata.codebasePath;
-
-                                if (codebasePath && typeof codebasePath === 'string') {
-                                    console.log(`[SYNC-CLOUD] 📍 Found codebase path: ${codebasePath} in collection: ${collectionName}`);
-                                    cloudCodebases.add(codebasePath);
-                                } else {
-                                    console.warn(`[SYNC-CLOUD] ⚠️  No codebasePath found in metadata for collection: ${collectionName}`);
-                                }
-                            } catch (parseError) {
-                                console.warn(`[SYNC-CLOUD] ⚠️  Failed to parse metadata JSON for collection ${collectionName}:`, parseError);
-                            }
-                        } else {
-                            console.warn(`[SYNC-CLOUD] ⚠️  No metadata found in collection: ${collectionName}`);
-                        }
-                    } else {
-                        console.log(`[SYNC-CLOUD] ℹ️  Collection ${collectionName} is empty`);
-                    }
-                } catch (collectionError: any) {
-                    console.warn(`[SYNC-CLOUD] ⚠️  Error checking collection ${collectionName}:`, collectionError.message || collectionError);
-                    // Continue with next collection
-                }
-            }
-
-            console.log(`[SYNC-CLOUD] 📊 Found ${cloudCodebases.size} valid codebases in cloud`);
-
-            // Get current local codebases
-            const localCodebases = new Set(this.snapshotManager.getIndexedCodebases());
-            console.log(`[SYNC-CLOUD] 📊 Found ${localCodebases.size} local codebases in snapshot`);
-
-            let hasChanges = false;
-
-            // Remove local codebases that don't exist in cloud
-            for (const localCodebase of localCodebases) {
-                if (!cloudCodebases.has(localCodebase)) {
-                    this.snapshotManager.removeIndexedCodebase(localCodebase);
-                    hasChanges = true;
-                    console.log(`[SYNC-CLOUD] ➖ Removed local codebase (not in cloud): ${localCodebase}`);
-                }
-            }
-
-            // Note: We don't add cloud codebases that are missing locally (as per user requirement)
-            console.log(`[SYNC-CLOUD] ℹ️  Skipping addition of cloud codebases not present locally (per sync policy)`);
-
-            if (hasChanges) {
-                this.snapshotManager.saveCodebaseSnapshot();
-                console.log(`[SYNC-CLOUD] 💾 Updated snapshot to match cloud state`);
-            } else {
-                console.log(`[SYNC-CLOUD] ✅ Local snapshot already matches cloud state`);
-            }
-
-            console.log(`[SYNC-CLOUD] ✅ Cloud sync completed successfully`);
-        } catch (error: any) {
-            console.error(`[SYNC-CLOUD] ❌ Error syncing codebases from cloud:`, error.message || error);
-            // Don't throw - this is not critical for the main functionality
-        }
-    }
-
     public async handleIndexCodebase(args: any) {
         const { path: codebasePath, force, splitter, customExtensions, ignorePatterns } = args;
         const forceReindex = force || false;
@@ -149,9 +26,6 @@ export class ToolHandlers {
         const customIgnorePatterns = ignorePatterns || [];
 
         try {
-            // Sync indexed codebases from cloud first
-            await this.syncIndexedCodebasesFromCloud();
-
             // Validate splitter parameter
             if (splitterType !== 'ast' && splitterType !== 'langchain') {
                 return {
@@ -199,11 +73,6 @@ export class ToolHandlers {
                 };
             }
 
-            //Check if the snapshot and cloud index are in sync
-            if (this.snapshotManager.getIndexedCodebases().includes(absolutePath) !== await this.context.hasIndex(absolutePath)) {
-                console.warn(`[INDEX-VALIDATION] ❌ Snapshot and cloud index mismatch: ${absolutePath}`);
-            }
-
             // Check if already indexed (unless force is true)
             if (!forceReindex && this.snapshotManager.getIndexedCodebases().includes(absolutePath)) {
                 return {
@@ -225,37 +94,6 @@ export class ToolHandlers {
                     console.log(`[FORCE-REINDEX] 🔄 Clearing index for '${absolutePath}'`);
                     await this.context.clearIndex(absolutePath);
                 }
-            }
-
-            // CRITICAL: Pre-index collection creation validation
-            try {
-                console.log(`[INDEX-VALIDATION] 🔍 Validating collection creation capability`);
-                const canCreateCollection = await this.context.getVectorDatabase().checkCollectionLimit();
-
-                if (!canCreateCollection) {
-                    console.error(`[INDEX-VALIDATION] ❌ Collection limit validation failed: ${absolutePath}`);
-
-                    // CRITICAL: Immediately return the COLLECTION_LIMIT_MESSAGE to MCP client
-                    return {
-                        content: [{
-                            type: "text",
-                            text: COLLECTION_LIMIT_MESSAGE
-                        }],
-                        isError: true
-                    };
-                }
-
-                console.log(`[INDEX-VALIDATION] ✅  Collection creation validation completed`);
-            } catch (validationError: any) {
-                // Handle other collection creation errors
-                console.error(`[INDEX-VALIDATION] ❌ Collection creation validation failed:`, validationError);
-                return {
-                    content: [{
-                        type: "text",
-                        text: `Error validating collection creation: ${validationError.message || validationError}`
-                    }],
-                    isError: true
-                };
             }
 
             // Add custom extensions if provided
@@ -284,7 +122,7 @@ export class ToolHandlers {
             // Track the codebase path for syncing
             trackCodebasePath(absolutePath);
 
-            // Start background indexing - now safe to proceed
+            // Start background indexing
             this.startBackgroundIndexing(absolutePath, forceReindex, splitterType);
 
             const pathInfo = codebasePath !== absolutePath
@@ -307,10 +145,8 @@ export class ToolHandlers {
             };
 
         } catch (error: any) {
-            // Enhanced error handling to prevent MCP service crash
             console.error('Error in handleIndexCodebase:', error);
 
-            // Ensure we always return a proper MCP response, never throw
             return {
                 content: [{
                     type: "text",
@@ -323,33 +159,31 @@ export class ToolHandlers {
 
     private async startBackgroundIndexing(codebasePath: string, forceReindex: boolean, splitterType: string) {
         const absolutePath = codebasePath;
-        let lastSaveTime = 0; // Track last save timestamp
+        let lastSaveTime = 0;
 
         try {
             console.log(`[BACKGROUND-INDEX] Starting background indexing for: ${absolutePath}`);
 
-            // Note: If force reindex, collection was already cleared during validation phase
             if (forceReindex) {
                 console.log(`[BACKGROUND-INDEX] ℹ️  Force reindex mode - collection was already cleared during validation`);
             }
 
-            // Use the existing Context instance for indexing.
             let contextForThisTask = this.context;
             if (splitterType !== 'ast') {
                 console.warn(`[BACKGROUND-INDEX] Non-AST splitter '${splitterType}' requested; falling back to AST splitter`);
             }
 
-            // Load ignore patterns from files first (including .ignore, .gitignore, etc.)
+            // Load ignore patterns from files first
             await this.context.getLoadedIgnorePatterns(absolutePath);
 
-            // Initialize file synchronizer with proper ignore patterns (including project-specific patterns)
-            const { FileSynchronizer } = await import("@zilliz/claude-context-core");
+            // Initialize file synchronizer with proper ignore patterns
+            const { FileSynchronizer } = await import("claude-context-core");
             const ignorePatterns = this.context.getIgnorePatterns() || [];
             console.log(`[BACKGROUND-INDEX] Using ignore patterns: ${ignorePatterns.join(', ')}`);
             const synchronizer = new FileSynchronizer(absolutePath, ignorePatterns);
             await synchronizer.initialize();
 
-            // Store synchronizer in the context (let context manage collection names)
+            // Store synchronizer in the context
             await this.context.getPreparedCollection(absolutePath);
             const collectionName = this.context.getCollectionName(absolutePath);
             this.context.setSynchronizer(collectionName, synchronizer);
@@ -359,19 +193,15 @@ export class ToolHandlers {
 
             console.log(`[BACKGROUND-INDEX] Starting indexing with ${splitterType} splitter for: ${absolutePath}`);
 
-            // Log embedding provider information before indexing
             const embeddingProvider = this.context.getEmbedding();
             console.log(`[BACKGROUND-INDEX] 🧠 Using embedding provider: ${embeddingProvider.getProvider()} with dimension: ${embeddingProvider.getDimension()}`);
 
-            // Start indexing with the appropriate context and progress tracking
             console.log(`[BACKGROUND-INDEX] 🚀 Beginning codebase indexing process...`);
             const stats = await contextForThisTask.indexCodebase(absolutePath, (progress) => {
-                // Update progress in snapshot manager using new method
                 this.snapshotManager.setCodebaseIndexing(absolutePath, progress.percentage);
 
-                // Save snapshot periodically (every 2 seconds to avoid too frequent saves)
                 const currentTime = Date.now();
-                if (currentTime - lastSaveTime >= 2000) { // 2 seconds = 2000ms
+                if (currentTime - lastSaveTime >= 2000) {
                     this.snapshotManager.saveCodebaseSnapshot();
                     lastSaveTime = currentTime;
                     console.log(`[BACKGROUND-INDEX] 💾 Saved progress snapshot at ${progress.percentage.toFixed(1)}%`);
@@ -381,11 +211,9 @@ export class ToolHandlers {
             });
             console.log(`[BACKGROUND-INDEX] ✅ Indexing completed successfully! Files: ${stats.indexedFiles}, Chunks: ${stats.totalChunks}`);
 
-            // Set codebase to indexed status with complete statistics
             this.snapshotManager.setCodebaseIndexed(absolutePath, stats);
             this.indexingStats = { indexedFiles: stats.indexedFiles, totalChunks: stats.totalChunks };
 
-            // Save snapshot after updating codebase lists
             this.snapshotManager.saveCodebaseSnapshot();
 
             let message = `Background indexing completed for '${absolutePath}' using ${splitterType.toUpperCase()} splitter.\nIndexed ${stats.indexedFiles} files, ${stats.totalChunks} chunks.`;
@@ -398,15 +226,12 @@ export class ToolHandlers {
         } catch (error: any) {
             console.error(`[BACKGROUND-INDEX] Error during indexing for ${absolutePath}:`, error);
 
-            // Get the last attempted progress
             const lastProgress = this.snapshotManager.getIndexingProgress(absolutePath);
 
-            // Set codebase to failed status with error information
             const errorMessage = error.message || String(error);
             this.snapshotManager.setCodebaseIndexFailed(absolutePath, errorMessage, lastProgress);
             this.snapshotManager.saveCodebaseSnapshot();
 
-            // Log error but don't crash MCP service - indexing errors are handled gracefully
             console.error(`[BACKGROUND-INDEX] Indexing failed for ${absolutePath}: ${errorMessage}`);
         }
     }
@@ -416,13 +241,8 @@ export class ToolHandlers {
         const resultLimit = limit || 10;
 
         try {
-            // Sync indexed codebases from cloud first
-            await this.syncIndexedCodebasesFromCloud();
-
-            // Force absolute path resolution - warn if relative path provided
             const absolutePath = ensureAbsolutePath(codebasePath);
 
-            // Validate path exists
             if (!fs.existsSync(absolutePath)) {
                 return {
                     content: [{
@@ -433,7 +253,6 @@ export class ToolHandlers {
                 };
             }
 
-            // Check if it's a directory
             const stat = fs.statSync(absolutePath);
             if (!stat.isDirectory()) {
                 return {
@@ -447,7 +266,6 @@ export class ToolHandlers {
 
             trackCodebasePath(absolutePath);
 
-            // Check if this codebase is indexed or being indexed
             const isIndexed = this.snapshotManager.getIndexedCodebases().includes(absolutePath);
             const isIndexing = this.snapshotManager.getIndexingCodebases().includes(absolutePath);
 
@@ -461,7 +279,6 @@ export class ToolHandlers {
                 };
             }
 
-            // Show indexing status if codebase is being indexed
             let indexingStatusMessage = '';
             if (isIndexing) {
                 indexingStatusMessage = `\n⚠️  **Indexing in Progress**: This codebase is currently being indexed in the background. Search results may be incomplete until indexing completes.`;
@@ -469,12 +286,9 @@ export class ToolHandlers {
 
             console.log(`[SEARCH] Searching in codebase: ${absolutePath}`);
             console.log(`[SEARCH] Query: "${query}"`);
-            console.log(`[SEARCH] Indexing status: ${isIndexing ? 'In Progress' : 'Completed'}`);
 
-            // Log embedding provider information before search
             const embeddingProvider = this.context.getEmbedding();
             console.log(`[SEARCH] 🧠 Using embedding provider: ${embeddingProvider.getProvider()} for search`);
-            console.log(`[SEARCH] 🔍 Generating embeddings for query using ${embeddingProvider.getProvider()}...`);
 
             // Build filter expression from extensionFilter list
             let filterExpr: string | undefined = undefined;
@@ -494,7 +308,6 @@ export class ToolHandlers {
                 filterExpr = `fileExtension in [${quoted}]`;
             }
 
-            // Search in the specified codebase
             const searchResults = await this.context.semanticSearch(
                 absolutePath,
                 query,
@@ -503,7 +316,7 @@ export class ToolHandlers {
                 filterExpr
             );
 
-            console.log(`[SEARCH] ✅ Search completed! Found ${searchResults.length} results using ${embeddingProvider.getProvider()} embeddings`);
+            console.log(`[SEARCH] ✅ Search completed! Found ${searchResults.length} results`);
 
             if (searchResults.length === 0) {
                 let noResultsMessage = `No results found for query: "${query}" in codebase '${absolutePath}'`;
@@ -518,7 +331,6 @@ export class ToolHandlers {
                 };
             }
 
-            // Format results
             const formattedResults = searchResults.map((result: any, index: number) => {
                 const location = `${result.relativePath}:${result.startLine}-${result.endLine}`;
                 const context = truncateContent(result.content, 5000);
@@ -543,20 +355,7 @@ export class ToolHandlers {
                 }]
             };
         } catch (error) {
-            // Check if this is the collection limit error
-            // Handle both direct string throws and Error objects containing the message
             const errorMessage = typeof error === 'string' ? error : (error instanceof Error ? error.message : String(error));
-
-            if (errorMessage === COLLECTION_LIMIT_MESSAGE || errorMessage.includes(COLLECTION_LIMIT_MESSAGE)) {
-                // Return the collection limit message as a successful response
-                // This ensures LLM treats it as final answer, not as retryable error
-                return {
-                    content: [{
-                        type: "text",
-                        text: COLLECTION_LIMIT_MESSAGE
-                    }]
-                };
-            }
 
             return {
                 content: [{
@@ -581,10 +380,8 @@ export class ToolHandlers {
         }
 
         try {
-            // Force absolute path resolution - warn if relative path provided
             const absolutePath = ensureAbsolutePath(codebasePath);
 
-            // Validate path exists
             if (!fs.existsSync(absolutePath)) {
                 return {
                     content: [{
@@ -595,7 +392,6 @@ export class ToolHandlers {
                 };
             }
 
-            // Check if it's a directory
             const stat = fs.statSync(absolutePath);
             if (!stat.isDirectory()) {
                 return {
@@ -607,7 +403,6 @@ export class ToolHandlers {
                 };
             }
 
-            // Check if this codebase is indexed or being indexed
             const isIndexed = this.snapshotManager.getIndexedCodebases().includes(absolutePath);
             const isIndexing = this.snapshotManager.getIndexingCodebases().includes(absolutePath);
 
@@ -638,13 +433,10 @@ export class ToolHandlers {
                 };
             }
 
-            // Completely remove the cleared codebase from snapshot
             this.snapshotManager.removeCodebaseCompletely(absolutePath);
 
-            // Reset indexing stats if this was the active codebase
             this.indexingStats = null;
 
-            // Save snapshot after clearing index
             this.snapshotManager.saveCodebaseSnapshot();
 
             let resultText = `Successfully cleared codebase '${absolutePath}'`;
@@ -663,20 +455,7 @@ export class ToolHandlers {
                 }]
             };
         } catch (error) {
-            // Check if this is the collection limit error
-            // Handle both direct string throws and Error objects containing the message
             const errorMessage = typeof error === 'string' ? error : (error instanceof Error ? error.message : String(error));
-
-            if (errorMessage === COLLECTION_LIMIT_MESSAGE || errorMessage.includes(COLLECTION_LIMIT_MESSAGE)) {
-                // Return the collection limit message as a successful response
-                // This ensures LLM treats it as final answer, not as retryable error
-                return {
-                    content: [{
-                        type: "text",
-                        text: COLLECTION_LIMIT_MESSAGE
-                    }]
-                };
-            }
 
             return {
                 content: [{
@@ -692,10 +471,8 @@ export class ToolHandlers {
         const { path: codebasePath } = args;
 
         try {
-            // Force absolute path resolution
             const absolutePath = ensureAbsolutePath(codebasePath);
 
-            // Validate path exists
             if (!fs.existsSync(absolutePath)) {
                 return {
                     content: [{
@@ -706,7 +483,6 @@ export class ToolHandlers {
                 };
             }
 
-            // Check if it's a directory
             const stat = fs.statSync(absolutePath);
             if (!stat.isDirectory()) {
                 return {
@@ -718,7 +494,6 @@ export class ToolHandlers {
                 };
             }
 
-            // Check indexing status using new status system
             const status = this.snapshotManager.getCodebaseStatus(absolutePath);
             const info = this.snapshotManager.getCodebaseInfo(absolutePath);
 
@@ -743,7 +518,6 @@ export class ToolHandlers {
                         const progressPercentage = indexingInfo.indexingPercentage || 0;
                         statusMessage = `🔄 Codebase '${absolutePath}' is currently being indexed. Progress: ${progressPercentage.toFixed(1)}%`;
 
-                        // Add more detailed status based on progress
                         if (progressPercentage < 10) {
                             statusMessage += ' (Preparing and scanning files...)';
                         } else if (progressPercentage < 100) {
@@ -797,4 +571,143 @@ export class ToolHandlers {
             };
         }
     }
-} 
+
+    public async handleReindexSubpath(args: any) {
+        const { path: codebasePath, subpath } = args;
+
+        try {
+            const absolutePath = ensureAbsolutePath(codebasePath);
+
+            // Validate codebase path exists
+            if (!fs.existsSync(absolutePath)) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Error: Path '${absolutePath}' does not exist.`
+                    }],
+                    isError: true
+                };
+            }
+
+            // Validate codebase is already indexed
+            const isIndexed = this.snapshotManager.getIndexedCodebases().includes(absolutePath);
+            if (!isIndexed) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Error: Codebase '${absolutePath}' is not indexed. Please index it first using the index_codebase tool.`
+                    }],
+                    isError: true
+                };
+            }
+
+            // Validate subpath
+            if (!subpath || subpath.trim() === '') {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Error: subpath parameter is required.`
+                    }],
+                    isError: true
+                };
+            }
+
+            const fullSubpath = path.join(absolutePath, subpath);
+            if (!fs.existsSync(fullSubpath)) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Error: Sub-path '${fullSubpath}' does not exist.`
+                    }],
+                    isError: true
+                };
+            }
+
+            const stat = fs.statSync(fullSubpath);
+            if (!stat.isDirectory()) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Error: Sub-path '${fullSubpath}' is not a directory.`
+                    }],
+                    isError: true
+                };
+            }
+
+            // Check if already indexing
+            if (this.snapshotManager.getIndexingCodebases().includes(absolutePath)) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Codebase '${absolutePath}' is already being indexed. Please wait for completion.`
+                    }],
+                    isError: true
+                };
+            }
+
+            // Set to indexing status
+            this.snapshotManager.setCodebaseIndexing(absolutePath, 0);
+            this.snapshotManager.saveCodebaseSnapshot();
+
+            // Start background sub-path re-indexing
+            this.startBackgroundSubpathReindex(absolutePath, subpath);
+
+            return {
+                content: [{
+                    type: "text",
+                    text: `Started background re-indexing for sub-path '${subpath}' in codebase '${absolutePath}'.\n\nRe-indexing is running in the background. You can search the codebase while re-indexing is in progress.`
+                }]
+            };
+
+        } catch (error: any) {
+            return {
+                content: [{
+                    type: "text",
+                    text: `Error starting sub-path re-indexing: ${error.message || error}`
+                }],
+                isError: true
+            };
+        }
+    }
+
+    private async startBackgroundSubpathReindex(codebasePath: string, subpath: string) {
+        let lastSaveTime = 0;
+
+        try {
+            console.log(`[BACKGROUND-REINDEX] Starting sub-path re-indexing: ${subpath} in ${codebasePath}`);
+
+            await this.context.getLoadedIgnorePatterns(codebasePath);
+
+            const stats = await this.context.reindexSubpath(codebasePath, subpath, (progress) => {
+                this.snapshotManager.setCodebaseIndexing(codebasePath, progress.percentage);
+
+                const currentTime = Date.now();
+                if (currentTime - lastSaveTime >= 2000) {
+                    this.snapshotManager.saveCodebaseSnapshot();
+                    lastSaveTime = currentTime;
+                }
+
+                console.log(`[BACKGROUND-REINDEX] Progress: ${progress.phase} - ${progress.percentage}%`);
+            });
+
+            console.log(`[BACKGROUND-REINDEX] ✅ Sub-path re-indexing completed! Files: ${stats.indexedFiles}, New chunks: ${stats.totalChunks}, Deleted chunks: ${stats.deletedChunks}`);
+
+            // Restore indexed status with updated stats
+            const existingInfo = this.snapshotManager.getCodebaseInfo(codebasePath) as any;
+            const updatedStats = {
+                indexedFiles: existingInfo?.indexedFiles || stats.indexedFiles,
+                totalChunks: existingInfo?.totalChunks || stats.totalChunks,
+                status: 'completed' as const
+            };
+            this.snapshotManager.setCodebaseIndexed(codebasePath, updatedStats);
+            this.snapshotManager.saveCodebaseSnapshot();
+
+        } catch (error: any) {
+            console.error(`[BACKGROUND-REINDEX] Error during sub-path re-indexing:`, error);
+
+            const lastProgress = this.snapshotManager.getIndexingProgress(codebasePath);
+            this.snapshotManager.setCodebaseIndexFailed(codebasePath, error.message || String(error), lastProgress);
+            this.snapshotManager.saveCodebaseSnapshot();
+        }
+    }
+}
